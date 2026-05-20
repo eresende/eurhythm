@@ -4,6 +4,11 @@ A premium, high-performance TUI (Terminal User Interface) music player and real-
 
 `eurhythm` combines low-latency playback engine design with highly optimized, hardware-accelerated Fast Fourier Transform (FFT) spectrum calculations and 24-bit True Color gradients. It's designed to turn your terminal into a gorgeous, reactive music dashboard.
 
+<p align="center">
+  <img src="assets/screenshot-1.png" alt="eurhythm TUI Music Player - Cyberpunk Theme" width="49%" />
+  <img src="assets/screenshot-2.png" alt="eurhythm TUI Music Player - Sunset Theme" width="49%" />
+</p>
+
 ---
 
 ## ✨ Features
