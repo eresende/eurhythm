@@ -331,6 +331,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eurhythm"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "lofty",
+ "rodio",
+ "rustfft",
+]
+
+[[package]]
 name = "extended"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,17 +553,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.48.0",
-]
-
-[[package]]
-name = "music_player"
-version = "0.1.0"
-dependencies = [
- "clap",
- "crossterm",
- "lofty",
- "rodio",
- "rustfft",
 ]
 
 [[package]]

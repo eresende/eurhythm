@@ -1075,7 +1075,7 @@ fn draw(
 }
 
 fn write_header(stdout: &mut impl Write, width: usize) -> io::Result<()> {
-    let title = " music_player ";
+    let title = " eurhythm ";
     let controls = " / search  r repeat  s shuffle  t theme  Enter play  q quit ";
     let fill = width.saturating_sub(2 + title.chars().count() + controls.chars().count());
 
