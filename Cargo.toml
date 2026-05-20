@@ -14,3 +14,5 @@ rodio = { version = "0.22", default-features = false, features = [
 ] }
 crossterm = "0.25"
 rustfft = "6.4"
+lofty = "0.21"
+

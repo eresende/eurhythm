@@ -52,6 +52,79 @@ struct Args {
     directory: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    fn next(self) -> Self {
+        match self {
+            RepeatMode::Off => RepeatMode::All,
+            RepeatMode::All => RepeatMode::One,
+            RepeatMode::One => RepeatMode::Off,
+        }
+    }
+}
+
+fn shuffle_indices(indices: &mut [usize]) {
+    use std::time::SystemTime;
+    let mut seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(123456789);
+    
+    let mut next_random = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        seed
+    };
+
+    if indices.len() <= 1 {
+        return;
+    }
+    for i in (1..indices.len()).rev() {
+        let j = (next_random() as usize) % (i + 1);
+        indices.swap(i, j);
+    }
+}
+
+fn regenerate_shuffle_queue(
+    shuffle_queue: &mut Vec<usize>,
+    playlist_indices: &[usize],
+    current_playing: Option<usize>,
+) {
+    shuffle_queue.clear();
+    let mut remaining: Vec<usize> = playlist_indices
+        .iter()
+        .copied()
+        .filter(|&idx| Some(idx) != current_playing)
+        .collect();
+    shuffle_indices(&mut remaining);
+    *shuffle_queue = remaining;
+}
+
+#[derive(Clone, Debug)]
+struct TrackMetadata {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+}
+
+fn read_track_metadata(path: &Path) -> Option<TrackMetadata> {
+    use lofty::prelude::*;
+    use lofty::probe::Probe;
+    let tagged_file = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged_file.primary_tag()?;
+
+    Some(TrackMetadata {
+        title: tag.title().as_deref().map(String::from),
+        artist: tag.artist().as_deref().map(String::from),
+        album: tag.album().as_deref().map(String::from),
+    })
+}
+
 struct TrackVisual {
     duration: Option<Duration>,
     spectra: Vec<Vec<usize>>,
@@ -134,7 +207,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut render_state = RenderState::default();
     let mut search_query = String::new();
     let mut is_searching = false;
-    let mut continuous_play = false;
+    let mut repeat_mode = RepeatMode::Off;
+    let mut shuffle = false;
+    let mut shuffle_queue = Vec::new();
+    let mut current_metadata: Option<TrackMetadata> = None;
     let mut status =
         String::from("Use / to search, j/k to select, Enter to play, Left/Right to seek.");
 
@@ -178,17 +254,54 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let playlist_indices = fuzzy_track_indices(&audio_files, &search_query);
         if let Some(index) = playing_index.filter(|_| player.empty()) {
-            let next_index = continuous_play
-                .then(|| next_playlist_index(&playlist_indices, index))
-                .flatten();
-
             playing_index = None;
             current_visual = None;
             pending_analysis = None;
             meter_state.clear();
+            current_metadata = None;
 
-            if let Some(next_index) = next_index {
-                current_index = next_index;
+            let next_index = match repeat_mode {
+                RepeatMode::One => Some(index),
+                _ => {
+                    if shuffle {
+                        shuffle_queue.retain(|idx| playlist_indices.contains(idx));
+                        if shuffle_queue.is_empty() {
+                            if repeat_mode == RepeatMode::All {
+                                regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, Some(index));
+                                shuffle_queue.pop()
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(shuffle_queue.remove(0))
+                        }
+                    } else {
+                        let next = next_playlist_index(&playlist_indices, index);
+                        if let Some(next_idx) = next {
+                            let pos_curr = playlist_indices.iter().position(|&x| x == index);
+                            let pos_next = playlist_indices.iter().position(|&x| x == next_idx);
+                            if let (Some(curr), Some(nxt)) = (pos_curr, pos_next) {
+                                if nxt <= curr {
+                                    if repeat_mode == RepeatMode::All {
+                                        Some(next_idx)
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    Some(next_idx)
+                                }
+                            } else {
+                                Some(next_idx)
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some(next_idx) = next_index {
+                current_index = next_idx;
                 start_track(
                     &player,
                     &audio_files,
@@ -199,6 +312,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     &mut meter_state,
                     &mut status,
                 );
+                current_metadata = read_track_metadata(&audio_files[current_index]);
             } else {
                 status = String::from("Finished.");
             }
@@ -218,10 +332,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             &status,
             player.get_pos(),
             current_visual.as_ref(),
+            current_metadata.as_ref(),
             player.is_paused(),
             player.volume(),
             pending_analysis.is_some(),
-            continuous_play,
+            repeat_mode,
+            shuffle,
             &search_query,
             is_searching,
             &mut meter_state,
@@ -316,16 +432,19 @@ fn main() -> Result<(), Box<dyn Error>> {
                     is_searching = true;
                     status = String::from("Type to fuzzy-search tracks. Esc clears search.");
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    continuous_play = !continuous_play;
-                    status = format!(
-                        "Continuous play {}.",
-                        if continuous_play {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
-                    );
+                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('r') | KeyCode::Char('R') => {
+                    repeat_mode = repeat_mode.next();
+                    status = format!("Repeat mode set to {:?}.", repeat_mode);
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    shuffle = !shuffle;
+                    if shuffle {
+                        regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
+                        status = String::from("Shuffle enabled.");
+                    } else {
+                        shuffle_queue.clear();
+                        status = String::from("Shuffle disabled.");
+                    }
                 }
                 KeyCode::Char(' ') => {
                     if let Some(index) = playing_index {
@@ -352,6 +471,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                             &mut meter_state,
                             &mut status,
                         );
+                        current_metadata = read_track_metadata(&audio_files[current_index]);
+                        if shuffle {
+                            regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
+                        }
                     }
                 }
                 KeyCode::Enter => {
@@ -371,6 +494,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut meter_state,
                         &mut status,
                     );
+                    current_metadata = read_track_metadata(&audio_files[current_index]);
+                    if shuffle {
+                        regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
+                    }
                 }
                 KeyCode::Esc => {
                     if search_query.is_empty() {
@@ -789,10 +916,12 @@ fn draw(
     status: &str,
     elapsed: Duration,
     visual: Option<&TrackVisual>,
+    metadata: Option<&TrackMetadata>,
     is_paused: bool,
     volume: f32,
     is_loading: bool,
-    continuous_play: bool,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
     search_query: &str,
     is_searching: bool,
     meter_state: &mut MeterState,
@@ -809,10 +938,12 @@ fn draw(
         status,
         elapsed,
         visual,
+        metadata,
         is_paused,
         volume,
         is_loading,
-        continuous_play,
+        repeat_mode,
+        shuffle,
         width,
     )?;
     write_spectrum_panel(&mut frame, elapsed, visual, is_paused, width, meter_state)?;
@@ -852,7 +983,7 @@ fn draw(
 
 fn write_header(stdout: &mut impl Write, width: usize) -> io::Result<()> {
     let title = " music_player ";
-    let controls = " / search  a auto  Enter play  q quit ";
+    let controls = " / search  r repeat  s shuffle  Enter play  q quit ";
     let fill = width.saturating_sub(2 + title.chars().count() + controls.chars().count());
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
@@ -875,10 +1006,12 @@ fn write_playback_panel(
     status: &str,
     elapsed: Duration,
     visual: Option<&TrackVisual>,
+    metadata: Option<&TrackMetadata>,
     is_paused: bool,
     volume: f32,
     is_loading: bool,
-    continuous_play: bool,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
     width: usize,
 ) -> io::Result<()> {
     write_panel_top(stdout, "playback", width, Color::Green)?;
@@ -889,7 +1022,13 @@ fn write_playback_panel(
     let state = playback_state(playing_index, is_paused);
     let duration = visual.and_then(|visual| visual.duration);
     let volume = volume_percent(volume);
-    let mode = if continuous_play { "auto" } else { "manual" };
+
+    let repeat_str = match repeat_mode {
+        RepeatMode::Off => "off",
+        RepeatMode::All => "all",
+        RepeatMode::One => "one",
+    };
+    let shuffle_str = if shuffle { "on" } else { "off" };
 
     write_panel_line(
         stdout,
@@ -901,12 +1040,32 @@ fn write_playback_panel(
             ("  volume", Color::Green),
             (" ", Color::DarkGrey),
             (&volume, Color::White),
-            ("  mode", Color::Green),
+            ("  repeat", Color::Green),
             (" ", Color::DarkGrey),
-            (mode, Color::White),
+            (repeat_str, Color::White),
+            ("  shuffle", Color::Green),
+            (" ", Color::DarkGrey),
+            (shuffle_str, Color::White),
         ],
     )?;
-    write_panel_text(stdout, width, "track", &now_playing, Color::White)?;
+
+    if playing_index.is_some() {
+        if let Some(meta) = metadata {
+            let title_str = meta.title.as_deref().unwrap_or(&now_playing);
+            write_panel_text(stdout, width, "title", title_str, Color::White)?;
+            if let Some(ref artist) = meta.artist {
+                write_panel_text(stdout, width, "artist", artist, Color::White)?;
+            }
+            if let Some(ref album) = meta.album {
+                write_panel_text(stdout, width, "album", album, Color::DarkGrey)?;
+            }
+        } else {
+            write_panel_text(stdout, width, "track", &now_playing, Color::White)?;
+        }
+    } else {
+        write_panel_text(stdout, width, "track", &now_playing, Color::White)?;
+    }
+
     write_panel_text(stdout, width, "info", status, Color::DarkGrey)?;
     write_panel_text(
         stdout,
