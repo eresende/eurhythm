@@ -1,0 +1,16 @@
+[package]
+name = "music_player"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+rodio = { version = "0.22", default-features = false, features = [
+    "playback",
+    "symphonia-aiff",
+    "symphonia-pcm",
+    "wav",
+    "mp3"
+] }
+crossterm = "0.25"
+rustfft = "6.4"
