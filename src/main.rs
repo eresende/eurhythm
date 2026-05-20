@@ -3,7 +3,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    style::{Color, ResetColor, SetForegroundColor},
+    style::{Color, ResetColor, SetForegroundColor, SetBackgroundColor},
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode, size,
@@ -66,6 +66,91 @@ impl RepeatMode {
             RepeatMode::All => RepeatMode::One,
             RepeatMode::One => RepeatMode::Off,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VisualizerTheme {
+    Cyberpunk,
+    Sunset,
+    Aurora,
+    Classic,
+}
+
+impl VisualizerTheme {
+    fn next(self) -> Self {
+        match self {
+            VisualizerTheme::Cyberpunk => VisualizerTheme::Sunset,
+            VisualizerTheme::Sunset => VisualizerTheme::Aurora,
+            VisualizerTheme::Aurora => VisualizerTheme::Classic,
+            VisualizerTheme::Classic => VisualizerTheme::Cyberpunk,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            VisualizerTheme::Cyberpunk => "Cyberpunk Neon",
+            VisualizerTheme::Sunset => "Golden Sunset",
+            VisualizerTheme::Aurora => "Northern Aurora",
+            VisualizerTheme::Classic => "Classic Vintage",
+        }
+    }
+}
+
+fn interpolate_color(c1: (u8, u8, u8), c2: (u8, u8, u8), factor: f32) -> Color {
+    let factor = factor.clamp(0.0, 1.0);
+    let r = (c1.0 as f32 + (c2.0 as f32 - c1.0 as f32) * factor).round() as u8;
+    let g = (c1.1 as f32 + (c2.1 as f32 - c1.1 as f32) * factor).round() as u8;
+    let b = (c1.2 as f32 + (c2.2 as f32 - c1.2 as f32) * factor).round() as u8;
+    Color::Rgb { r, g, b }
+}
+
+fn get_theme_color(theme: VisualizerTheme, row: usize, height: usize, is_paused: bool) -> Color {
+    if is_paused {
+        return Color::Rgb { r: 85, g: 95, b: 110 }; // sleek blue-slate for paused state
+    }
+    let y = (row - 1) as f32 / (height - 1) as f32;
+    match theme {
+        VisualizerTheme::Cyberpunk => {
+            if y < 0.5 {
+                interpolate_color((106, 0, 244), (0, 245, 212), y * 2.0)
+            } else {
+                interpolate_color((0, 245, 212), (255, 0, 127), (y - 0.5) * 2.0)
+            }
+        }
+        VisualizerTheme::Sunset => {
+            if y < 0.5 {
+                interpolate_color((255, 210, 0), (247, 127, 0), y * 2.0)
+            } else {
+                interpolate_color((247, 127, 0), (214, 40, 40), (y - 0.5) * 2.0)
+            }
+        }
+        VisualizerTheme::Aurora => {
+            if y < 0.5 {
+                interpolate_color((10, 36, 99), (0, 180, 216), y * 2.0)
+            } else {
+                interpolate_color((0, 180, 216), (144, 224, 169), (y - 0.5) * 2.0)
+            }
+        }
+        VisualizerTheme::Classic => {
+            if y < 0.5 {
+                interpolate_color((46, 196, 182), (255, 159, 28), y * 2.0)
+            } else {
+                interpolate_color((255, 159, 28), (231, 29, 54), (y - 0.5) * 2.0)
+            }
+        }
+    }
+}
+
+fn get_peak_color(theme: VisualizerTheme, _peak: f32, _height: usize, is_paused: bool) -> Color {
+    if is_paused {
+        return Color::Rgb { r: 60, g: 65, b: 75 };
+    }
+    match theme {
+        VisualizerTheme::Cyberpunk => Color::Rgb { r: 255, g: 100, b: 200 },
+        VisualizerTheme::Sunset => Color::Rgb { r: 255, g: 255, b: 255 },
+        VisualizerTheme::Aurora => Color::Rgb { r: 200, g: 255, b: 220 },
+        VisualizerTheme::Classic => Color::Rgb { r: 255, g: 80, b: 80 },
     }
 }
 
@@ -211,6 +296,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut shuffle = false;
     let mut shuffle_queue = Vec::new();
     let mut current_metadata: Option<TrackMetadata> = None;
+    let mut visualizer_theme = VisualizerTheme::Cyberpunk;
     let mut status =
         String::from("Use / to search, j/k to select, Enter to play, Left/Right to seek.");
 
@@ -338,6 +424,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             pending_analysis.is_some(),
             repeat_mode,
             shuffle,
+            visualizer_theme,
             &search_query,
             is_searching,
             &mut meter_state,
@@ -445,6 +532,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                         shuffle_queue.clear();
                         status = String::from("Shuffle disabled.");
                     }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    visualizer_theme = visualizer_theme.next();
+                    status = format!("Visualizer theme set to {}.", visualizer_theme.name());
                 }
                 KeyCode::Char(' ') => {
                     if let Some(index) = playing_index {
@@ -922,6 +1013,7 @@ fn draw(
     is_loading: bool,
     repeat_mode: RepeatMode,
     shuffle: bool,
+    visualizer_theme: VisualizerTheme,
     search_query: &str,
     is_searching: bool,
     meter_state: &mut MeterState,
@@ -944,9 +1036,10 @@ fn draw(
         is_loading,
         repeat_mode,
         shuffle,
+        visualizer_theme,
         width,
     )?;
-    write_spectrum_panel(&mut frame, elapsed, visual, is_paused, width, meter_state)?;
+    write_spectrum_panel(&mut frame, elapsed, visual, is_paused, width, meter_state, visualizer_theme)?;
     write_playlist_panel(
         &mut frame,
         audio_files,
@@ -983,7 +1076,7 @@ fn draw(
 
 fn write_header(stdout: &mut impl Write, width: usize) -> io::Result<()> {
     let title = " music_player ";
-    let controls = " / search  r repeat  s shuffle  Enter play  q quit ";
+    let controls = " / search  r repeat  s shuffle  t theme  Enter play  q quit ";
     let fill = width.saturating_sub(2 + title.chars().count() + controls.chars().count());
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
@@ -1012,6 +1105,7 @@ fn write_playback_panel(
     is_loading: bool,
     repeat_mode: RepeatMode,
     shuffle: bool,
+    visualizer_theme: VisualizerTheme,
     width: usize,
 ) -> io::Result<()> {
     write_panel_top(stdout, "playback", width, Color::Green)?;
@@ -1019,16 +1113,52 @@ fn write_playback_panel(
     let now_playing = playing_index
         .map(|index| display_name(&audio_files[index]))
         .unwrap_or_else(|| String::from("none"));
-    let state = playback_state(playing_index, is_paused);
-    let duration = visual.and_then(|visual| visual.duration);
-    let volume = volume_percent(volume);
+
+    let state_str = match (playing_index.is_some(), is_paused) {
+        (false, _) => "■ IDLE",
+        (true, true) => "⏸ PAUSED",
+        (true, false) => "▶ PLAYING",
+    };
+    let state_color = if playing_index.is_none() {
+        Color::DarkGrey
+    } else if is_paused {
+        Color::Yellow
+    } else {
+        Color::Green
+    };
+
+    let vol_percent = volume_percent(volume);
+    
+    // Normal part: 0% to 100% (volume 0.0 to 1.0)
+    let vol_norm = volume.min(1.0);
+    let filled_norm = (vol_norm * 5.0).round() as usize;
+    let empty_norm = 5 - filled_norm;
+    let normal_filled = "▮".repeat(filled_norm);
+    let normal_empty = "░".repeat(empty_norm);
+    
+    // Boost part: 100% to 200% (volume 1.0 to 2.0). Only present when volume > 1.0.
+    let boost_filled = if volume > 1.0 {
+        let vol_boost = volume - 1.0;
+        let filled_boost = (vol_boost * 5.0).round() as usize;
+        "▮".repeat(filled_boost)
+    } else {
+        String::new()
+    };
 
     let repeat_str = match repeat_mode {
-        RepeatMode::Off => "off",
-        RepeatMode::All => "all",
-        RepeatMode::One => "one",
+        RepeatMode::Off => "→ OFF",
+        RepeatMode::All => "🔁 ALL",
+        RepeatMode::One => "🔂 ONE",
     };
-    let shuffle_str = if shuffle { "on" } else { "off" };
+    let repeat_color = match repeat_mode {
+        RepeatMode::Off => Color::DarkGrey,
+        _ => Color::Cyan,
+    };
+
+    let shuffle_str = if shuffle { "🔀 ON" } else { "→ OFF" };
+    let shuffle_color = if shuffle { Color::Cyan } else { Color::DarkGrey };
+
+    let theme_str = visualizer_theme.name();
 
     write_panel_line(
         stdout,
@@ -1036,16 +1166,31 @@ fn write_playback_panel(
         &[
             ("state", Color::Green),
             (" ", Color::DarkGrey),
-            (state, status_color(is_paused)),
+            (state_str, state_color),
             ("  volume", Color::Green),
             (" ", Color::DarkGrey),
-            (&volume, Color::White),
-            ("  repeat", Color::Green),
+            (&vol_percent, Color::White),
+            (" [", Color::DarkGrey),
+            (&normal_filled, Color::Cyan),
+            (&normal_empty, Color::DarkGrey),
+            (&boost_filled, Color::Red),
+            ("]", Color::DarkGrey),
+            ("  theme", Color::Green),
             (" ", Color::DarkGrey),
-            (repeat_str, Color::White),
+            (theme_str, Color::White),
+        ],
+    )?;
+
+    write_panel_line(
+        stdout,
+        width,
+        &[
+            ("repeat", Color::Green),
+            (" ", Color::DarkGrey),
+            (repeat_str, repeat_color),
             ("  shuffle", Color::Green),
             (" ", Color::DarkGrey),
-            (shuffle_str, Color::White),
+            (shuffle_str, shuffle_color),
         ],
     )?;
 
@@ -1067,13 +1212,54 @@ fn write_playback_panel(
     }
 
     write_panel_text(stdout, width, "info", status, Color::DarkGrey)?;
-    write_panel_text(
-        stdout,
-        width,
-        "time",
-        &progress_line(elapsed, duration, width, is_loading),
-        Color::White,
-    )?;
+
+    let duration = visual.and_then(|visual| visual.duration);
+    let time_str = playback_time(elapsed, duration);
+    let time_str_len = time_str.chars().count();
+
+    execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+    write!(stdout, "│ ")?;
+    execute!(stdout, SetForegroundColor(Color::Green))?;
+    write!(stdout, "time: ")?;
+
+    let label_len = "time: ".len();
+    let available = width.saturating_sub(4 + label_len + time_str_len + 1);
+
+    if available > 4 {
+        let filled_chars = duration
+            .filter(|d| !d.is_zero())
+            .map(|d| {
+                let progress = elapsed.as_secs_f64() / d.as_secs_f64();
+                (progress.clamp(0.0, 1.0) * available as f64).round() as usize
+            })
+            .unwrap_or(0);
+
+        let filled_bar_len = filled_chars.saturating_sub(1);
+        let unfilled_bar_len = available.saturating_sub(filled_chars);
+
+        execute!(stdout, SetForegroundColor(Color::Rgb { r: 0, g: 245, b: 212 }))?;
+        write!(stdout, "{}", "━".repeat(filled_bar_len))?;
+
+        execute!(stdout, SetForegroundColor(Color::White))?;
+        if filled_chars > 0 {
+            write!(stdout, "●")?;
+        } else {
+            write!(stdout, "━")?;
+        }
+
+        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        let empty_char = if is_loading { "━" } else { "─" };
+        write!(stdout, "{}", empty_char.repeat(unfilled_bar_len))?;
+    }
+
+    execute!(stdout, SetForegroundColor(Color::White))?;
+    write!(stdout, " {time_str}")?;
+
+    let total_written = label_len + available + 1 + time_str_len;
+    let padding = width.saturating_sub(4 + total_written);
+    execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+    write!(stdout, "{}│\r\n", " ".repeat(padding))?;
+    execute!(stdout, ResetColor)?;
 
     write_panel_bottom(stdout, width)
 }
@@ -1085,6 +1271,7 @@ fn write_spectrum_panel(
     is_paused: bool,
     width: usize,
     meter_state: &mut MeterState,
+    visualizer_theme: VisualizerTheme,
 ) -> io::Result<()> {
     write_panel_top(stdout, "spectrum", width, Color::Yellow)?;
     write_visualizer(
@@ -1095,6 +1282,7 @@ fn write_spectrum_panel(
         width.saturating_sub(4),
         METER_HEIGHT,
         meter_state,
+        visualizer_theme,
     )?;
     write_panel_bottom(stdout, width)
 }
@@ -1126,30 +1314,68 @@ fn write_playlist_panel(
     {
         let index = *index;
         let path = &audio_files[index];
-        let selector = if index == current_index { ">" } else { " " };
-        let state = if Some(index) == playing_index {
-            "playing"
-        } else {
-            ""
-        };
+        let is_selected = index == current_index;
+        let is_playing = Some(index) == playing_index;
 
-        let state_width = if state.is_empty() { 0 } else { state.len() + 1 };
-        let name_width = width.saturating_sub(7 + state_width);
-        let name = truncate(&display_name(path), name_width);
-        let item = if state.is_empty() {
-            format!("{selector} {name}")
-        } else {
-            format!("{selector} {name} {state}")
-        };
-        let color = if index == current_index {
-            Color::White
-        } else if Some(index) == playing_index {
-            Color::Green
-        } else {
-            Color::DarkGrey
-        };
+        let state_str = if is_playing { " [PLAYING]" } else { "" };
+        let name_str = display_name(path);
+        
+        let inner_width = width.saturating_sub(4);
+        
+        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        write!(stdout, "│ ")?;
 
-        write_panel_text(stdout, width, "", &item, color)?;
+        if is_selected {
+            execute!(stdout, SetBackgroundColor(Color::Rgb { r: 40, g: 44, b: 52 }))?;
+            execute!(stdout, SetForegroundColor(Color::Cyan))?;
+            write!(stdout, "▶ ")?;
+            
+            execute!(stdout, SetForegroundColor(Color::White))?;
+            let reserved = 2 + state_str.len();
+            let max_name_len = inner_width.saturating_sub(reserved);
+            let truncated_name = truncate(&name_str, max_name_len);
+            write!(stdout, "{truncated_name}")?;
+            
+            if is_playing {
+                execute!(stdout, SetForegroundColor(Color::Green))?;
+                write!(stdout, "{state_str}")?;
+            }
+            
+            let written = reserved + display_width(&truncated_name);
+            let padding = inner_width.saturating_sub(written);
+            write!(stdout, "{}", " ".repeat(padding))?;
+            
+            execute!(stdout, ResetColor)?;
+        } else {
+            if is_playing {
+                execute!(stdout, SetForegroundColor(Color::Green))?;
+                write!(stdout, "  ")?;
+                let reserved = 2 + state_str.len();
+                let max_name_len = inner_width.saturating_sub(reserved);
+                let truncated_name = truncate(&name_str, max_name_len);
+                write!(stdout, "{truncated_name}")?;
+                execute!(stdout, SetForegroundColor(Color::Green))?;
+                write!(stdout, "{state_str}")?;
+                
+                let written = reserved + display_width(&truncated_name);
+                let padding = inner_width.saturating_sub(written);
+                write!(stdout, "{}", " ".repeat(padding))?;
+            } else {
+                execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+                write!(stdout, "  ")?;
+                let max_name_len = inner_width.saturating_sub(2);
+                let truncated_name = truncate(&name_str, max_name_len);
+                write!(stdout, "{truncated_name}")?;
+                
+                let written = 2 + display_width(&truncated_name);
+                let padding = inner_width.saturating_sub(written);
+                write!(stdout, "{}", " ".repeat(padding))?;
+            }
+        }
+
+        execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
+        write!(stdout, " │\r\n")?;
+        execute!(stdout, ResetColor)?;
     }
 
     if playlist_indices.is_empty() {
@@ -1207,6 +1433,19 @@ fn write_panel_bottom(stdout: &mut impl Write, width: usize) -> io::Result<()> {
     execute!(stdout, ResetColor)
 }
 
+fn display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let cp = c as u32;
+            if (cp >= 0x1F300 && cp <= 0x1F9FF) || cp >= 0x1F000 {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 fn write_panel_text(
     stdout: &mut impl Write,
     width: usize,
@@ -1221,7 +1460,7 @@ fn write_panel_text(
     }
     text.push_str(value);
     let text = truncate(&text, width.saturating_sub(4));
-    let text_len = text.chars().count();
+    let text_len = display_width(&text);
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
     write!(stdout, "│ ")?;
@@ -1241,7 +1480,7 @@ fn write_panel_line(
     width: usize,
     parts: &[(&str, Color)],
 ) -> io::Result<()> {
-    let content_len = parts.iter().map(|(part, _)| part.len()).sum::<usize>();
+    let content_len = parts.iter().map(|(part, _)| display_width(part)).sum::<usize>();
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
     write!(stdout, "│ ")?;
@@ -1260,70 +1499,11 @@ fn write_panel_line(
     execute!(stdout, ResetColor)
 }
 
+
 fn terminal_width() -> usize {
     size()
         .map(|(columns, _)| usize::from(columns).saturating_sub(1).clamp(60, 120))
         .unwrap_or(80)
-}
-
-fn status_color(is_paused: bool) -> Color {
-    if is_paused {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
-}
-
-fn playback_state(playing_index: Option<usize>, is_paused: bool) -> &'static str {
-    if playing_index.is_none() {
-        "idle"
-    } else if is_paused {
-        "paused"
-    } else {
-        "playing"
-    }
-}
-
-fn progress_bar(
-    elapsed: Duration,
-    duration: Option<Duration>,
-    width: usize,
-    is_loading: bool,
-) -> String {
-    let filled = duration
-        .filter(|duration| !duration.is_zero())
-        .map(|duration| {
-            let progress = elapsed.as_secs_f64() / duration.as_secs_f64();
-            (progress.clamp(0.0, 1.0) * width as f64).round() as usize
-        })
-        .unwrap_or(0);
-    let empty = if is_loading { "━" } else { "-" };
-
-    format!(
-        "[{}{}]",
-        "#".repeat(filled),
-        empty.repeat(width.saturating_sub(filled))
-    )
-}
-
-fn progress_line(
-    elapsed: Duration,
-    duration: Option<Duration>,
-    panel_width: usize,
-    is_loading: bool,
-) -> String {
-    let time = playback_time(elapsed, duration);
-    let available = panel_width.saturating_sub("time: ".len() + 4);
-    let bar_width = available.saturating_sub(time.chars().count() + 3);
-
-    if bar_width == 0 {
-        return truncate(&time, available);
-    }
-
-    format!(
-        "{} {time}",
-        progress_bar(elapsed, duration, bar_width, is_loading)
-    )
 }
 
 fn playback_time(elapsed: Duration, duration: Option<Duration>) -> String {
@@ -1353,6 +1533,7 @@ fn write_visualizer(
     inner_width: usize,
     height: usize,
     meter_state: &mut MeterState,
+    visualizer_theme: VisualizerTheme,
 ) -> io::Result<()> {
     let bar_count = meter_bar_count(inner_width);
     let columns = eased_visualizer_levels(visual, elapsed, bar_count, meter_state);
@@ -1368,19 +1549,19 @@ fn write_visualizer(
         write!(stdout, "│ {}", " ".repeat(left_padding))?;
         execute!(
             stdout,
-            SetForegroundColor(visualizer_color(row, height, is_paused))
+            SetForegroundColor(get_theme_color(visualizer_theme, row, height, is_paused))
         )?;
 
         for (column_index, column) in columns.iter().enumerate() {
             if should_draw_peak(row, column) {
                 execute!(
                     stdout,
-                    SetForegroundColor(peak_color(column.peak, height, is_paused))
+                    SetForegroundColor(get_peak_color(visualizer_theme, column.peak, height, is_paused))
                 )?;
                 write!(stdout, "{}", "▀".repeat(METER_BAR_WIDTH))?;
                 execute!(
                     stdout,
-                    SetForegroundColor(visualizer_color(row, height, is_paused))
+                    SetForegroundColor(get_theme_color(visualizer_theme, row, height, is_paused))
                 )?;
             } else {
                 let segment = bar_segment(row, column.level);
@@ -1460,17 +1641,7 @@ fn should_draw_peak(row: usize, column: &MeterColumn) -> bool {
     peak_row == row && column.peak - column.level > 0.75
 }
 
-fn peak_color(peak: f32, height: usize, is_paused: bool) -> Color {
-    if is_paused {
-        return Color::DarkGrey;
-    }
 
-    if peak > height as f32 * 0.72 {
-        Color::Red
-    } else {
-        Color::Yellow
-    }
-}
 
 fn bar_segment(row: usize, level: f32) -> &'static str {
     let fill = (level - (row - 1) as f32).clamp(0.0, 1.0);
@@ -1512,19 +1683,7 @@ fn visualizer_levels(
         .collect()
 }
 
-fn visualizer_color(row: usize, height: usize, is_paused: bool) -> Color {
-    if is_paused {
-        return Color::DarkGrey;
-    }
 
-    if row > height * 2 / 3 {
-        Color::Red
-    } else if row > height / 3 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
-}
 
 fn truncate(value: &str, max_len: usize) -> String {
     if value.chars().count() <= max_len {
