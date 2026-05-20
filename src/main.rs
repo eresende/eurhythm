@@ -160,7 +160,7 @@ fn shuffle_indices(indices: &mut [usize]) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(123456789);
-    
+
     let mut next_random = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         seed
@@ -180,7 +180,6 @@ fn regenerate_shuffle_queue(
     playlist_indices: &[usize],
     current_playing: Option<usize>,
 ) {
-    shuffle_queue.clear();
     let mut remaining: Vec<usize> = playlist_indices
         .iter()
         .copied()
@@ -271,6 +270,335 @@ impl Drop for TerminalGuard {
     }
 }
 
+// --- Player state ---
+
+/// All mutable player state that persists across loop iterations.
+struct PlayerState {
+    current_index: usize,
+    playing_index: Option<usize>,
+    current_visual: Option<TrackVisual>,
+    pending_analysis: Option<PendingAnalysis>,
+    meter_state: MeterState,
+    render_state: RenderState,
+    search_query: String,
+    is_searching: bool,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+    shuffle_queue: Vec<usize>,
+    current_metadata: Option<TrackMetadata>,
+    visualizer_theme: VisualizerTheme,
+    status: String,
+}
+
+impl PlayerState {
+    fn new() -> Self {
+        Self {
+            current_index: 0,
+            playing_index: None,
+            current_visual: None,
+            pending_analysis: None,
+            meter_state: MeterState::default(),
+            render_state: RenderState::default(),
+            search_query: String::new(),
+            is_searching: false,
+            repeat_mode: RepeatMode::Off,
+            shuffle: false,
+            shuffle_queue: Vec::new(),
+            current_metadata: None,
+            visualizer_theme: VisualizerTheme::Cyberpunk,
+            status: String::from(
+                "Use / to search, j/k to select, Enter to play, Left/Right to seek.",
+            ),
+        }
+    }
+
+    /// Polls the background analysis thread and updates visual/status accordingly.
+    fn process_analysis_update(&mut self, audio_files: &[PathBuf]) {
+        let update = self
+            .pending_analysis
+            .as_ref()
+            .map(|pending| (pending.index, pending.receiver.try_recv()));
+
+        match update {
+            Some((index, Ok(AnalysisMessage::Preview(visual)))) => {
+                if self.playing_index == Some(index) {
+                    self.current_visual = Some(visual);
+                    self.meter_state.clear();
+                }
+            }
+            Some((index, Ok(AnalysisMessage::Complete(visual)))) => {
+                self.pending_analysis = None;
+                if self.playing_index == Some(index) {
+                    self.current_visual = Some(visual);
+                    self.meter_state.clear();
+                    self.status = format!("Playing {}.", display_name(&audio_files[index]));
+                }
+            }
+            Some((index, Ok(AnalysisMessage::Failed(error)))) => {
+                self.pending_analysis = None;
+                if self.playing_index == Some(index) {
+                    self.status = format!(
+                        "Spectrum unavailable for {}: {error}",
+                        display_name(&audio_files[index])
+                    );
+                }
+            }
+            Some((_, Err(TryRecvError::Disconnected))) => {
+                self.pending_analysis = None;
+                self.status = String::from("Spectrum analysis stopped.");
+            }
+            Some((_, Err(TryRecvError::Empty))) | None => {}
+        }
+    }
+
+    /// Advances to the next track when the current one has finished playing.
+    fn advance_if_finished(
+        &mut self,
+        player: &Player,
+        audio_files: &[PathBuf],
+        playlist_indices: &[usize],
+    ) {
+        let Some(finished_index) = self.playing_index.filter(|_| player.empty()) else {
+            return;
+        };
+
+        self.playing_index = None;
+        self.current_visual = None;
+        self.pending_analysis = None;
+        self.meter_state.clear();
+        self.current_metadata = None;
+
+        let next_index = next_track_index(
+            finished_index,
+            playlist_indices,
+            self.repeat_mode,
+            self.shuffle,
+            &mut self.shuffle_queue,
+        );
+
+        if let Some(next_idx) = next_index {
+            self.current_index = next_idx;
+            self.start_track(player, audio_files, next_idx);
+            self.current_metadata = read_track_metadata(&audio_files[next_idx]);
+        } else {
+            self.status = String::from("Finished.");
+        }
+    }
+
+    /// Starts playback of the track at `index`, updating visual and analysis state.
+    fn start_track(&mut self, player: &Player, audio_files: &[PathBuf], index: usize) {
+        let path = &audio_files[index];
+        self.meter_state.clear();
+
+        match start_selected_track(player, path, index) {
+            Ok(analysis) => {
+                self.playing_index = Some(index);
+                self.current_visual = None;
+                self.pending_analysis = Some(analysis);
+                self.status = format!("Playing {}.", display_name(path));
+            }
+            Err(error) => {
+                self.playing_index = None;
+                self.current_visual = None;
+                self.pending_analysis = None;
+                self.status = format!("Could not play {}: {error}", display_name(path));
+            }
+        }
+    }
+
+    /// Handles a key press. Returns `false` when the user requests to quit.
+    fn handle_key(
+        &mut self,
+        code: KeyCode,
+        player: &Player,
+        audio_files: &[PathBuf],
+        playlist_indices: &[usize],
+    ) -> bool {
+        if self.is_searching {
+            match code {
+                KeyCode::Esc => {
+                    self.is_searching = false;
+                    self.search_query.clear();
+                    self.status = String::from("Search cleared.");
+                }
+                KeyCode::Enter => {
+                    self.is_searching = false;
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                }
+                KeyCode::Char(character) => {
+                    if !character.is_control() {
+                        self.search_query.push(character);
+                    }
+                }
+                _ => {}
+            }
+
+            let updated_indices = fuzzy_track_indices(audio_files, &self.search_query);
+            if let Some(&index) = updated_indices.first() {
+                self.current_index = index;
+            }
+            return true;
+        }
+
+        match code {
+            KeyCode::Char('+') => {
+                let volume = change_volume(player, VOLUME_STEP);
+                self.status = format!("Volume {}.", volume_percent(volume));
+            }
+            KeyCode::Char('-') => {
+                let volume = change_volume(player, -VOLUME_STEP);
+                self.status = format!("Volume {}.", volume_percent(volume));
+            }
+            KeyCode::Left => {
+                match seek_by(
+                    player,
+                    self.current_visual.as_ref(),
+                    self.playing_index.is_some(),
+                    -SEEK_STEP_SECONDS,
+                ) {
+                    Ok(position) => {
+                        self.meter_state.clear();
+                        self.status = format!("Seeked to {}.", format_duration(position));
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not seek: {error}");
+                    }
+                }
+            }
+            KeyCode::Right => {
+                match seek_by(
+                    player,
+                    self.current_visual.as_ref(),
+                    self.playing_index.is_some(),
+                    SEEK_STEP_SECONDS,
+                ) {
+                    Ok(position) => {
+                        self.meter_state.clear();
+                        self.status = format!("Seeked to {}.", format_duration(position));
+                    }
+                    Err(error) => {
+                        self.status = format!("Could not seek: {error}");
+                    }
+                }
+            }
+            KeyCode::Up => {
+                self.current_index = move_selection(playlist_indices, self.current_index, -1);
+            }
+            KeyCode::Down => {
+                self.current_index = move_selection(playlist_indices, self.current_index, 1);
+            }
+            KeyCode::Char('/') => {
+                self.is_searching = true;
+                self.status = String::from("Type to fuzzy-search tracks. Esc clears search.");
+            }
+            // 'a' and 'r' are aliases — both toggle the repeat mode.
+            KeyCode::Char('a' | 'A' | 'r' | 'R') => {
+                self.repeat_mode = self.repeat_mode.next();
+                self.status = format!("Repeat mode set to {:?}.", self.repeat_mode);
+            }
+            KeyCode::Char('s' | 'S') => {
+                self.shuffle = !self.shuffle;
+                if self.shuffle {
+                    regenerate_shuffle_queue(
+                        &mut self.shuffle_queue,
+                        playlist_indices,
+                        self.playing_index,
+                    );
+                    self.status = String::from("Shuffle enabled.");
+                } else {
+                    self.shuffle_queue.clear();
+                    self.status = String::from("Shuffle disabled.");
+                }
+            }
+            KeyCode::Char('t' | 'T') => {
+                self.visualizer_theme = self.visualizer_theme.next();
+                self.status = format!("Visualizer theme set to {}.", self.visualizer_theme.name());
+            }
+            KeyCode::Char(' ') => {
+                if let Some(index) = self.playing_index {
+                    if player.is_paused() {
+                        player.play();
+                        self.status = format!("Playing {}.", display_name(&audio_files[index]));
+                    } else {
+                        player.pause();
+                        self.status = format!("Paused {}.", display_name(&audio_files[index]));
+                    }
+                } else {
+                    if !playlist_indices.contains(&self.current_index) {
+                        self.status = String::from("No matching track selected.");
+                        return true;
+                    }
+
+                    let index = self.current_index;
+                    self.start_track(player, audio_files, index);
+                    self.current_metadata = read_track_metadata(&audio_files[index]);
+                    if self.shuffle {
+                        regenerate_shuffle_queue(
+                            &mut self.shuffle_queue,
+                            playlist_indices,
+                            self.playing_index,
+                        );
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if !playlist_indices.contains(&self.current_index) {
+                    self.status = String::from("No matching track selected.");
+                    return true;
+                }
+
+                player.stop();
+                let index = self.current_index;
+                self.start_track(player, audio_files, index);
+                self.current_metadata = read_track_metadata(&audio_files[index]);
+                if self.shuffle {
+                    regenerate_shuffle_queue(
+                        &mut self.shuffle_queue,
+                        playlist_indices,
+                        self.playing_index,
+                    );
+                }
+            }
+            KeyCode::Esc => {
+                if self.search_query.is_empty() {
+                    return false;
+                }
+                self.search_query.clear();
+                self.current_index = 0;
+                self.status = String::from("Search cleared.");
+            }
+            KeyCode::Char('q') => return false,
+            _ => {}
+        }
+
+        true
+    }
+}
+
+// --- Render context ---
+
+/// A snapshot of all the data needed to render a single frame.
+struct PlaybackContext<'a> {
+    audio_files: &'a [PathBuf],
+    playlist_indices: &'a [usize],
+    current_index: usize,
+    playing_index: Option<usize>,
+    status: &'a str,
+    elapsed: Duration,
+    visual: Option<&'a TrackVisual>,
+    metadata: Option<&'a TrackMetadata>,
+    is_paused: bool,
+    volume: f32,
+    is_loading: bool,
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+    visualizer_theme: VisualizerTheme,
+    search_query: &'a str,
+    is_searching: bool,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let audio_files = audio_files_in(&args.directory)?;
@@ -284,152 +612,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device_sink = rodio::DeviceSinkBuilder::open_default_sink()?;
     let player = Player::connect_new(device_sink.mixer());
 
-    let mut current_index = 0;
-    let mut playing_index = None;
-    let mut current_visual = None;
-    let mut pending_analysis: Option<PendingAnalysis> = None;
-    let mut meter_state = MeterState::default();
-    let mut render_state = RenderState::default();
-    let mut search_query = String::new();
-    let mut is_searching = false;
-    let mut repeat_mode = RepeatMode::Off;
-    let mut shuffle = false;
-    let mut shuffle_queue = Vec::new();
-    let mut current_metadata: Option<TrackMetadata> = None;
-    let mut visualizer_theme = VisualizerTheme::Cyberpunk;
-    let mut status =
-        String::from("Use / to search, j/k to select, Enter to play, Left/Right to seek.");
+    let mut state = PlayerState::new();
 
     loop {
-        let analysis_update = pending_analysis
-            .as_ref()
-            .map(|pending| (pending.index, pending.receiver.try_recv()));
+        let playlist_indices = fuzzy_track_indices(&audio_files, &state.search_query);
 
-        match analysis_update {
-            Some((index, Ok(AnalysisMessage::Preview(visual)))) => {
-                if playing_index == Some(index) {
-                    current_visual = Some(visual);
-                    meter_state.clear();
-                }
-            }
-            Some((index, Ok(AnalysisMessage::Complete(visual)))) => {
-                pending_analysis = None;
+        state.process_analysis_update(&audio_files);
+        state.advance_if_finished(&player, &audio_files, &playlist_indices);
 
-                if playing_index == Some(index) {
-                    current_visual = Some(visual);
-                    meter_state.clear();
-                    status = format!("Playing {}.", display_name(&audio_files[index]));
-                }
-            }
-            Some((index, Ok(AnalysisMessage::Failed(error)))) => {
-                pending_analysis = None;
-
-                if playing_index == Some(index) {
-                    status = format!(
-                        "Spectrum unavailable for {}: {error}",
-                        display_name(&audio_files[index])
-                    );
-                }
-            }
-            Some((_, Err(TryRecvError::Disconnected))) => {
-                pending_analysis = None;
-                status = String::from("Spectrum analysis stopped.");
-            }
-            Some((_, Err(TryRecvError::Empty))) | None => {}
-        }
-
-        let playlist_indices = fuzzy_track_indices(&audio_files, &search_query);
-        if let Some(index) = playing_index.filter(|_| player.empty()) {
-            playing_index = None;
-            current_visual = None;
-            pending_analysis = None;
-            meter_state.clear();
-            current_metadata = None;
-
-            let next_index = match repeat_mode {
-                RepeatMode::One => Some(index),
-                _ => {
-                    if shuffle {
-                        shuffle_queue.retain(|idx| playlist_indices.contains(idx));
-                        if shuffle_queue.is_empty() {
-                            if repeat_mode == RepeatMode::All {
-                                regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, Some(index));
-                                shuffle_queue.pop()
-                            } else {
-                                None
-                            }
-                        } else {
-                            Some(shuffle_queue.remove(0))
-                        }
-                    } else {
-                        let next = next_playlist_index(&playlist_indices, index);
-                        if let Some(next_idx) = next {
-                            let pos_curr = playlist_indices.iter().position(|&x| x == index);
-                            let pos_next = playlist_indices.iter().position(|&x| x == next_idx);
-                            if let (Some(curr), Some(nxt)) = (pos_curr, pos_next) {
-                                if nxt <= curr {
-                                    if repeat_mode == RepeatMode::All {
-                                        Some(next_idx)
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    Some(next_idx)
-                                }
-                            } else {
-                                Some(next_idx)
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                }
-            };
-
-            if let Some(next_idx) = next_index {
-                current_index = next_idx;
-                start_track(
-                    &player,
-                    &audio_files,
-                    current_index,
-                    &mut playing_index,
-                    &mut current_visual,
-                    &mut pending_analysis,
-                    &mut meter_state,
-                    &mut status,
-                );
-                current_metadata = read_track_metadata(&audio_files[current_index]);
-            } else {
-                status = String::from("Finished.");
+        if !playlist_indices.contains(&state.current_index) {
+            if let Some(&index) = playlist_indices.first() {
+                state.current_index = index;
             }
         }
 
-        if !playlist_indices.contains(&current_index) {
-            if let Some(index) = playlist_indices.first() {
-                current_index = *index;
-            }
-        }
-
-        draw(
-            &audio_files,
-            &playlist_indices,
-            current_index,
-            playing_index,
-            &status,
-            player.get_pos(),
-            current_visual.as_ref(),
-            current_metadata.as_ref(),
-            player.is_paused(),
-            player.volume(),
-            pending_analysis.is_some(),
-            repeat_mode,
-            shuffle,
-            visualizer_theme,
-            &search_query,
-            is_searching,
-            &mut meter_state,
-            &mut render_state,
-        )?;
+        let ctx = PlaybackContext {
+            audio_files: &audio_files,
+            playlist_indices: &playlist_indices,
+            current_index: state.current_index,
+            playing_index: state.playing_index,
+            status: &state.status,
+            elapsed: player.get_pos(),
+            visual: state.current_visual.as_ref(),
+            metadata: state.current_metadata.as_ref(),
+            is_paused: player.is_paused(),
+            volume: player.volume(),
+            is_loading: state.pending_analysis.is_some(),
+            repeat_mode: state.repeat_mode,
+            shuffle: state.shuffle,
+            visualizer_theme: state.visualizer_theme,
+            search_query: &state.search_query,
+            is_searching: state.is_searching,
+        };
+        draw(&ctx, &mut state.meter_state, &mut state.render_state)?;
 
         if !event::poll(Duration::from_millis(90))? {
             continue;
@@ -440,167 +655,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            if is_searching {
-                match key_event.code {
-                    KeyCode::Esc => {
-                        is_searching = false;
-                        search_query.clear();
-                        status = String::from("Search cleared.");
-                    }
-                    KeyCode::Enter => {
-                        is_searching = false;
-                    }
-                    KeyCode::Backspace => {
-                        search_query.pop();
-                    }
-                    KeyCode::Char(character) => {
-                        if !character.is_control() {
-                            search_query.push(character);
-                        }
-                    }
-                    _ => {}
-                }
-
-                let playlist_indices = fuzzy_track_indices(&audio_files, &search_query);
-                if let Some(index) = playlist_indices.first() {
-                    current_index = *index;
-                }
-                continue;
-            }
-
-            match key_event.code {
-                KeyCode::Char('+') => {
-                    let volume = change_volume(&player, VOLUME_STEP);
-                    status = format!("Volume {}.", volume_percent(volume));
-                }
-                KeyCode::Char('-') => {
-                    let volume = change_volume(&player, -VOLUME_STEP);
-                    status = format!("Volume {}.", volume_percent(volume));
-                }
-                KeyCode::Left => {
-                    match seek_by(
-                        &player,
-                        current_visual.as_ref(),
-                        playing_index.is_some(),
-                        -SEEK_STEP_SECONDS,
-                    ) {
-                        Ok(position) => {
-                            meter_state.clear();
-                            status = format!("Seeked to {}.", format_duration(position));
-                        }
-                        Err(error) => {
-                            status = format!("Could not seek: {error}");
-                        }
-                    }
-                }
-                KeyCode::Right => {
-                    match seek_by(
-                        &player,
-                        current_visual.as_ref(),
-                        playing_index.is_some(),
-                        SEEK_STEP_SECONDS,
-                    ) {
-                        Ok(position) => {
-                            meter_state.clear();
-                            status = format!("Seeked to {}.", format_duration(position));
-                        }
-                        Err(error) => {
-                            status = format!("Could not seek: {error}");
-                        }
-                    }
-                }
-                KeyCode::Up => {
-                    current_index = move_selection(&playlist_indices, current_index, -1);
-                }
-                KeyCode::Down => {
-                    current_index = move_selection(&playlist_indices, current_index, 1);
-                }
-                KeyCode::Char('/') => {
-                    is_searching = true;
-                    status = String::from("Type to fuzzy-search tracks. Esc clears search.");
-                }
-                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('r') | KeyCode::Char('R') => {
-                    repeat_mode = repeat_mode.next();
-                    status = format!("Repeat mode set to {:?}.", repeat_mode);
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') => {
-                    shuffle = !shuffle;
-                    if shuffle {
-                        regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
-                        status = String::from("Shuffle enabled.");
-                    } else {
-                        shuffle_queue.clear();
-                        status = String::from("Shuffle disabled.");
-                    }
-                }
-                KeyCode::Char('t') | KeyCode::Char('T') => {
-                    visualizer_theme = visualizer_theme.next();
-                    status = format!("Visualizer theme set to {}.", visualizer_theme.name());
-                }
-                KeyCode::Char(' ') => {
-                    if let Some(index) = playing_index {
-                        if player.is_paused() {
-                            player.play();
-                            status = format!("Playing {}.", display_name(&audio_files[index]));
-                        } else {
-                            player.pause();
-                            status = format!("Paused {}.", display_name(&audio_files[index]));
-                        }
-                    } else {
-                        if !playlist_indices.contains(&current_index) {
-                            status = String::from("No matching track selected.");
-                            continue;
-                        }
-
-                        start_track(
-                            &player,
-                            &audio_files,
-                            current_index,
-                            &mut playing_index,
-                            &mut current_visual,
-                            &mut pending_analysis,
-                            &mut meter_state,
-                            &mut status,
-                        );
-                        current_metadata = read_track_metadata(&audio_files[current_index]);
-                        if shuffle {
-                            regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
-                        }
-                    }
-                }
-                KeyCode::Enter => {
-                    if !playlist_indices.contains(&current_index) {
-                        status = String::from("No matching track selected.");
-                        continue;
-                    }
-
-                    player.stop();
-                    start_track(
-                        &player,
-                        &audio_files,
-                        current_index,
-                        &mut playing_index,
-                        &mut current_visual,
-                        &mut pending_analysis,
-                        &mut meter_state,
-                        &mut status,
-                    );
-                    current_metadata = read_track_metadata(&audio_files[current_index]);
-                    if shuffle {
-                        regenerate_shuffle_queue(&mut shuffle_queue, &playlist_indices, playing_index);
-                    }
-                }
-                KeyCode::Esc => {
-                    if search_query.is_empty() {
-                        break;
-                    }
-
-                    search_query.clear();
-                    current_index = 0;
-                    status = String::from("Search cleared.");
-                }
-                KeyCode::Char('q') => break,
-                _ => {}
+            if !state.handle_key(key_event.code, &player, &audio_files, &playlist_indices) {
+                break;
             }
         }
     }
@@ -702,32 +758,47 @@ fn next_playlist_index(indices: &[usize], current_index: usize) -> Option<usize>
         .filter(|index| *index != current_index || indices.len() > 1)
 }
 
-fn start_track(
-    player: &Player,
-    audio_files: &[PathBuf],
-    index: usize,
-    playing_index: &mut Option<usize>,
-    current_visual: &mut Option<TrackVisual>,
-    pending_analysis: &mut Option<PendingAnalysis>,
-    meter_state: &mut MeterState,
-    status: &mut String,
-) {
-    let path = &audio_files[index];
-    meter_state.clear();
+/// Determines the index of the next track to play after `finished_index` has ended.
+///
+/// Returns `None` when playback should stop (end of playlist, no repeat).
+fn next_track_index(
+    finished_index: usize,
+    playlist_indices: &[usize],
+    repeat_mode: RepeatMode,
+    shuffle: bool,
+    shuffle_queue: &mut Vec<usize>,
+) -> Option<usize> {
+    if repeat_mode == RepeatMode::One {
+        return Some(finished_index);
+    }
 
-    match start_selected_track(player, path, index) {
-        Ok(analysis) => {
-            *playing_index = Some(index);
-            *current_visual = None;
-            *pending_analysis = Some(analysis);
-            *status = format!("Playing {}.", display_name(path));
+    if shuffle {
+        // Drop any queued indices that are no longer in the visible playlist.
+        shuffle_queue.retain(|idx| playlist_indices.contains(idx));
+
+        if shuffle_queue.is_empty() {
+            if repeat_mode == RepeatMode::All {
+                regenerate_shuffle_queue(shuffle_queue, playlist_indices, Some(finished_index));
+                shuffle_queue.pop()
+            } else {
+                None
+            }
+        } else {
+            Some(shuffle_queue.remove(0))
         }
-        Err(error) => {
-            *playing_index = None;
-            *current_visual = None;
-            *pending_analysis = None;
-            meter_state.clear();
-            *status = format!("Could not play {}: {error}", display_name(path));
+    } else {
+        let next_idx = next_playlist_index(playlist_indices, finished_index)?;
+
+        // Detect wrap-around: if next position is at or before current, we looped.
+        let pos_curr = playlist_indices.iter().position(|&x| x == finished_index);
+        let pos_next = playlist_indices.iter().position(|&x| x == next_idx);
+
+        match (pos_curr, pos_next) {
+            (Some(curr), Some(nxt)) if nxt <= curr => {
+                // Wrapped back to the start of the playlist.
+                (repeat_mode == RepeatMode::All).then_some(next_idx)
+            }
+            _ => Some(next_idx),
         }
     }
 }
@@ -749,18 +820,18 @@ fn seek_by(
     }
 
     let current = player.get_pos();
-    let position = if delta_seconds.is_negative() {
+    let new_position = if delta_seconds.is_negative() {
         current.saturating_sub(Duration::from_secs(delta_seconds.unsigned_abs()))
     } else {
         current.saturating_add(Duration::from_secs(delta_seconds as u64))
     };
-    let position = visual
+    let new_position = visual
         .and_then(|visual| visual.duration)
-        .map(|duration| position.min(duration))
-        .unwrap_or(position);
+        .map(|duration| new_position.min(duration))
+        .unwrap_or(new_position);
 
-    player.try_seek(position)?;
-    Ok(position)
+    player.try_seek(new_position)?;
+    Ok(new_position)
 }
 
 fn volume_percent(volume: f32) -> String {
@@ -999,23 +1070,10 @@ fn magnitude_to_height(magnitude: f32, max_magnitude: f32, height: usize) -> usi
         .clamp(1.0, height as f32) as usize
 }
 
+// --- Rendering ---
+
 fn draw(
-    audio_files: &[PathBuf],
-    playlist_indices: &[usize],
-    current_index: usize,
-    playing_index: Option<usize>,
-    status: &str,
-    elapsed: Duration,
-    visual: Option<&TrackVisual>,
-    metadata: Option<&TrackMetadata>,
-    is_paused: bool,
-    volume: f32,
-    is_loading: bool,
-    repeat_mode: RepeatMode,
-    shuffle: bool,
-    visualizer_theme: VisualizerTheme,
-    search_query: &str,
-    is_searching: bool,
+    ctx: &PlaybackContext<'_>,
     meter_state: &mut MeterState,
     render_state: &mut RenderState,
 ) -> io::Result<()> {
@@ -1023,33 +1081,9 @@ fn draw(
 
     let width = terminal_width();
     write_header(&mut frame, width)?;
-    write_playback_panel(
-        &mut frame,
-        audio_files,
-        playing_index,
-        status,
-        elapsed,
-        visual,
-        metadata,
-        is_paused,
-        volume,
-        is_loading,
-        repeat_mode,
-        shuffle,
-        visualizer_theme,
-        width,
-    )?;
-    write_spectrum_panel(&mut frame, elapsed, visual, is_paused, width, meter_state, visualizer_theme)?;
-    write_playlist_panel(
-        &mut frame,
-        audio_files,
-        playlist_indices,
-        current_index,
-        playing_index,
-        search_query,
-        is_searching,
-        width,
-    )?;
+    write_playback_panel(&mut frame, ctx, width)?;
+    write_spectrum_panel(&mut frame, ctx, width, meter_state)?;
+    write_playlist_panel(&mut frame, ctx, width)?;
 
     let frame_height = frame.iter().filter(|byte| **byte == b'\n').count();
     let should_clear_tail = frame_height < render_state.last_height;
@@ -1094,71 +1128,61 @@ fn write_header(stdout: &mut impl Write, width: usize) -> io::Result<()> {
 
 fn write_playback_panel(
     stdout: &mut impl Write,
-    audio_files: &[PathBuf],
-    playing_index: Option<usize>,
-    status: &str,
-    elapsed: Duration,
-    visual: Option<&TrackVisual>,
-    metadata: Option<&TrackMetadata>,
-    is_paused: bool,
-    volume: f32,
-    is_loading: bool,
-    repeat_mode: RepeatMode,
-    shuffle: bool,
-    visualizer_theme: VisualizerTheme,
+    ctx: &PlaybackContext<'_>,
     width: usize,
 ) -> io::Result<()> {
     write_panel_top(stdout, "playback", width, Color::Green)?;
 
-    let now_playing = playing_index
-        .map(|index| display_name(&audio_files[index]))
+    let now_playing = ctx
+        .playing_index
+        .map(|index| display_name(&ctx.audio_files[index]))
         .unwrap_or_else(|| String::from("none"));
 
-    let state_str = match (playing_index.is_some(), is_paused) {
+    let state_str = match (ctx.playing_index.is_some(), ctx.is_paused) {
         (false, _) => "■ IDLE",
         (true, true) => "⏸ PAUSED",
         (true, false) => "▶ PLAYING",
     };
-    let state_color = if playing_index.is_none() {
+    let state_color = if ctx.playing_index.is_none() {
         Color::DarkGrey
-    } else if is_paused {
+    } else if ctx.is_paused {
         Color::Yellow
     } else {
         Color::Green
     };
 
-    let vol_percent = volume_percent(volume);
-    
+    let vol_percent = volume_percent(ctx.volume);
+
     // Normal part: 0% to 100% (volume 0.0 to 1.0)
-    let vol_norm = volume.min(1.0);
+    let vol_norm = ctx.volume.min(1.0);
     let filled_norm = (vol_norm * 5.0).round() as usize;
     let empty_norm = 5 - filled_norm;
     let normal_filled = "▮".repeat(filled_norm);
     let normal_empty = "░".repeat(empty_norm);
-    
+
     // Boost part: 100% to 200% (volume 1.0 to 2.0). Only present when volume > 1.0.
-    let boost_filled = if volume > 1.0 {
-        let vol_boost = volume - 1.0;
+    let boost_filled = if ctx.volume > 1.0 {
+        let vol_boost = ctx.volume - 1.0;
         let filled_boost = (vol_boost * 5.0).round() as usize;
         "▮".repeat(filled_boost)
     } else {
         String::new()
     };
 
-    let repeat_str = match repeat_mode {
+    let repeat_str = match ctx.repeat_mode {
         RepeatMode::Off => "→ OFF",
         RepeatMode::All => "🔁 ALL",
         RepeatMode::One => "🔂 ONE",
     };
-    let repeat_color = match repeat_mode {
+    let repeat_color = match ctx.repeat_mode {
         RepeatMode::Off => Color::DarkGrey,
         _ => Color::Cyan,
     };
 
-    let shuffle_str = if shuffle { "🔀 ON" } else { "→ OFF" };
-    let shuffle_color = if shuffle { Color::Cyan } else { Color::DarkGrey };
+    let shuffle_str = if ctx.shuffle { "🔀 ON" } else { "→ OFF" };
+    let shuffle_color = if ctx.shuffle { Color::Cyan } else { Color::DarkGrey };
 
-    let theme_str = visualizer_theme.name();
+    let theme_str = ctx.visualizer_theme.name();
 
     write_panel_line(
         stdout,
@@ -1194,8 +1218,8 @@ fn write_playback_panel(
         ],
     )?;
 
-    if playing_index.is_some() {
-        if let Some(meta) = metadata {
+    if ctx.playing_index.is_some() {
+        if let Some(meta) = ctx.metadata {
             let title_str = meta.title.as_deref().unwrap_or(&now_playing);
             write_panel_text(stdout, width, "title", title_str, Color::White)?;
             if let Some(ref artist) = meta.artist {
@@ -1211,10 +1235,10 @@ fn write_playback_panel(
         write_panel_text(stdout, width, "track", &now_playing, Color::White)?;
     }
 
-    write_panel_text(stdout, width, "info", status, Color::DarkGrey)?;
+    write_panel_text(stdout, width, "info", ctx.status, Color::DarkGrey)?;
 
-    let duration = visual.and_then(|visual| visual.duration);
-    let time_str = playback_time(elapsed, duration);
+    let duration = ctx.visual.and_then(|visual| visual.duration);
+    let time_str = playback_time(ctx.elapsed, duration);
     let time_str_len = time_str.chars().count();
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
@@ -1229,7 +1253,7 @@ fn write_playback_panel(
         let filled_chars = duration
             .filter(|d| !d.is_zero())
             .map(|d| {
-                let progress = elapsed.as_secs_f64() / d.as_secs_f64();
+                let progress = ctx.elapsed.as_secs_f64() / d.as_secs_f64();
                 (progress.clamp(0.0, 1.0) * available as f64).round() as usize
             })
             .unwrap_or(0);
@@ -1248,7 +1272,7 @@ fn write_playback_panel(
         }
 
         execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-        let empty_char = if is_loading { "━" } else { "─" };
+        let empty_char = if ctx.is_loading { "━" } else { "─" };
         write!(stdout, "{}", empty_char.repeat(unfilled_bar_len))?;
     }
 
@@ -1266,111 +1290,92 @@ fn write_playback_panel(
 
 fn write_spectrum_panel(
     stdout: &mut impl Write,
-    elapsed: Duration,
-    visual: Option<&TrackVisual>,
-    is_paused: bool,
+    ctx: &PlaybackContext<'_>,
     width: usize,
     meter_state: &mut MeterState,
-    visualizer_theme: VisualizerTheme,
 ) -> io::Result<()> {
     write_panel_top(stdout, "spectrum", width, Color::Yellow)?;
     write_visualizer(
         stdout,
-        elapsed,
-        visual,
-        is_paused,
+        ctx.elapsed,
+        ctx.visual,
+        ctx.is_paused,
         width.saturating_sub(4),
         METER_HEIGHT,
         meter_state,
-        visualizer_theme,
+        ctx.visualizer_theme,
     )?;
     write_panel_bottom(stdout, width)
 }
 
 fn write_playlist_panel(
     stdout: &mut impl Write,
-    audio_files: &[PathBuf],
-    playlist_indices: &[usize],
-    current_index: usize,
-    playing_index: Option<usize>,
-    search_query: &str,
-    is_searching: bool,
+    ctx: &PlaybackContext<'_>,
     width: usize,
 ) -> io::Result<()> {
-    let title = playlist_title(search_query, is_searching, playlist_indices.len());
+    let title = playlist_title(ctx.search_query, ctx.is_searching, ctx.playlist_indices.len());
     write_panel_top(stdout, &title, width, Color::Red)?;
 
     let visible_rows = playlist_visible_rows();
-    let current_position = playlist_indices
+    let current_position = ctx
+        .playlist_indices
         .iter()
-        .position(|index| *index == current_index)
+        .position(|index| *index == ctx.current_index)
         .unwrap_or(0);
     let start_position = current_position.saturating_sub(visible_rows.saturating_sub(1));
+    let inner_width = width.saturating_sub(4);
 
-    for index in playlist_indices
+    for &index in ctx
+        .playlist_indices
         .iter()
         .skip(start_position)
         .take(visible_rows)
     {
-        let index = *index;
-        let path = &audio_files[index];
-        let is_selected = index == current_index;
-        let is_playing = Some(index) == playing_index;
-
+        let path = &ctx.audio_files[index];
+        let is_selected = index == ctx.current_index;
+        let is_playing = Some(index) == ctx.playing_index;
         let state_str = if is_playing { " [PLAYING]" } else { "" };
         let name_str = display_name(path);
-        
-        let inner_width = width.saturating_sub(4);
-        
+
         execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
         write!(stdout, "│ ")?;
 
         if is_selected {
-            execute!(stdout, SetBackgroundColor(Color::Rgb { r: 40, g: 44, b: 52 }))?;
-            execute!(stdout, SetForegroundColor(Color::Cyan))?;
-            write!(stdout, "▶ ")?;
-            
-            execute!(stdout, SetForegroundColor(Color::White))?;
-            let reserved = 2 + state_str.len();
-            let max_name_len = inner_width.saturating_sub(reserved);
-            let truncated_name = truncate(&name_str, max_name_len);
-            write!(stdout, "{truncated_name}")?;
-            
-            if is_playing {
-                execute!(stdout, SetForegroundColor(Color::Green))?;
-                write!(stdout, "{state_str}")?;
-            }
-            
-            let written = reserved + display_width(&truncated_name);
-            let padding = inner_width.saturating_sub(written);
-            write!(stdout, "{}", " ".repeat(padding))?;
-            
-            execute!(stdout, ResetColor)?;
+            write_playlist_row(
+                stdout,
+                &name_str,
+                state_str,
+                inner_width,
+                "▶ ",
+                Color::Cyan,
+                Color::White,
+                Color::Green,
+                Some(Color::Rgb { r: 40, g: 44, b: 52 }),
+            )?;
+        } else if is_playing {
+            write_playlist_row(
+                stdout,
+                &name_str,
+                state_str,
+                inner_width,
+                "  ",
+                Color::Green,
+                Color::Green,
+                Color::Green,
+                None,
+            )?;
         } else {
-            if is_playing {
-                execute!(stdout, SetForegroundColor(Color::Green))?;
-                write!(stdout, "  ")?;
-                let reserved = 2 + state_str.len();
-                let max_name_len = inner_width.saturating_sub(reserved);
-                let truncated_name = truncate(&name_str, max_name_len);
-                write!(stdout, "{truncated_name}")?;
-                execute!(stdout, SetForegroundColor(Color::Green))?;
-                write!(stdout, "{state_str}")?;
-                
-                let written = reserved + display_width(&truncated_name);
-                let padding = inner_width.saturating_sub(written);
-                write!(stdout, "{}", " ".repeat(padding))?;
-            } else {
-                execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
-                write!(stdout, "  ")?;
-                let max_name_len = inner_width.saturating_sub(2);
-                let truncated_name = truncate(&name_str, max_name_len);
-                write!(stdout, "{truncated_name}")?;
-                
-                let written = 2 + display_width(&truncated_name);
-                let padding = inner_width.saturating_sub(written);
-                write!(stdout, "{}", " ".repeat(padding))?;
-            }
+            write_playlist_row(
+                stdout,
+                &name_str,
+                "",
+                inner_width,
+                "  ",
+                Color::DarkGrey,
+                Color::DarkGrey,
+                Color::DarkGrey,
+                None,
+            )?;
         }
 
         execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
@@ -1378,11 +1383,57 @@ fn write_playlist_panel(
         execute!(stdout, ResetColor)?;
     }
 
-    if playlist_indices.is_empty() {
+    if ctx.playlist_indices.is_empty() {
         write_panel_text(stdout, width, "", "No matches", Color::DarkGrey)?;
     }
 
     write_panel_bottom(stdout, width)
+}
+
+/// Renders the content of a single playlist row (prefix + name + state badge + padding).
+///
+/// The caller is responsible for writing the leading "│ " border before this call and
+/// the trailing " │\r\n" border after it.
+fn write_playlist_row(
+    stdout: &mut impl Write,
+    name: &str,
+    state_str: &str,
+    inner_width: usize,
+    prefix: &str,
+    prefix_color: Color,
+    name_color: Color,
+    state_color: Color,
+    background: Option<Color>,
+) -> io::Result<()> {
+    // 2 display columns for the prefix ("▶ " or "  "), plus the ASCII state badge.
+    let reserved = 2 + state_str.len();
+    let max_name_len = inner_width.saturating_sub(reserved);
+    let truncated_name = truncate(name, max_name_len);
+
+    if let Some(bg) = background {
+        execute!(stdout, SetBackgroundColor(bg))?;
+    }
+
+    execute!(stdout, SetForegroundColor(prefix_color))?;
+    write!(stdout, "{prefix}")?;
+
+    execute!(stdout, SetForegroundColor(name_color))?;
+    write!(stdout, "{truncated_name}")?;
+
+    if !state_str.is_empty() {
+        execute!(stdout, SetForegroundColor(state_color))?;
+        write!(stdout, "{state_str}")?;
+    }
+
+    let written = reserved + display_width(&truncated_name);
+    let padding = inner_width.saturating_sub(written);
+    write!(stdout, "{}", " ".repeat(padding))?;
+
+    if background.is_some() {
+        execute!(stdout, ResetColor)?;
+    }
+
+    Ok(())
 }
 
 fn playlist_title(search_query: &str, is_searching: bool, match_count: usize) -> String {
@@ -1498,7 +1549,6 @@ fn write_panel_line(
     )?;
     execute!(stdout, ResetColor)
 }
-
 
 fn terminal_width() -> usize {
     size()
@@ -1641,8 +1691,6 @@ fn should_draw_peak(row: usize, column: &MeterColumn) -> bool {
     peak_row == row && column.peak - column.level > 0.75
 }
 
-
-
 fn bar_segment(row: usize, level: f32) -> &'static str {
     let fill = (level - (row - 1) as f32).clamp(0.0, 1.0);
 
@@ -1682,8 +1730,6 @@ fn visualizer_levels(
         })
         .collect()
 }
-
-
 
 fn truncate(value: &str, max_len: usize) -> String {
     if value.chars().count() <= max_len {
