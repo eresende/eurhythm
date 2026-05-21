@@ -2,11 +2,38 @@
 
 A premium, high-performance TUI (Terminal User Interface) music player and real-time audio spectrum visualizer written in Rust.
 
-`eurhythm` combines low-latency playback engine design with highly optimized, hardware-accelerated Fast Fourier Transform (FFT) spectrum calculations and 24-bit True Color gradients. It's designed [...]
+`eurhythm` combines low-latency playback engine design with highly optimized, hardware-accelerated Fast Fourier Transform (FFT) spectrum calculations and 24-bit True Color gradients. It's designed to bring rich, smooth audio aesthetics directly to your command line.
 
 <p align="center">
-  <img src="assets/screenshot-1.png" alt="eurhythm TUI Music Player - Cyberpunk Theme" width="49%" />
-  <img src="assets/screenshot-2.png" alt="eurhythm TUI Music Player - Sunset Theme" width="49%" />
+  <video src="assets/screencast-1.mp4" width="100%" controls autoplay loop muted></video>
+</p>
+
+---
+
+## 📸 Interface Gallery
+
+### 🌌 Cyberpunk Neon Theme
+<p align="center">
+  <img src="assets/screenshot-1.png" alt="Cyberpunk Theme - Active Playback" width="49%" />
+  <img src="assets/screenshot-2.png" alt="Cyberpunk Theme - Fuzzy Search" width="49%" />
+</p>
+
+### 🌅 Golden Sunset Theme
+<p align="center">
+  <img src="assets/screenshot-3.png" alt="Golden Sunset Theme - Active Playback" width="49%" />
+  <img src="assets/screenshot-4.png" alt="Golden Sunset Theme - Fuzzy Search" width="49%" />
+</p>
+
+### 🌲 Northern Aurora Theme
+<p align="center">
+  <img src="assets/screenshot-5.png" alt="Northern Aurora Theme - Active Playback" width="49%" />
+  <img src="assets/screenshot-6.png" alt="Northern Aurora Theme - Fuzzy Search" width="49%" />
+</p>
+
+### 📻 Classic Vintage Theme
+<p align="center">
+  <img src="assets/screenshot-7.png" alt="Classic Vintage Theme - Active Playback" width="49%" />
+  <img src="assets/screenshot-8.png" alt="Classic Vintage Theme - Fuzzy Search" width="49%" />
 </p>
 
 ---
