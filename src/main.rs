@@ -50,6 +50,9 @@ const NON_PLAYLIST_ROWS: usize = 24;
 )]
 struct Args {
     directory: PathBuf,
+
+    #[arg(short, long, help = "Scan directory recursively")]
+    recursive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -601,7 +604,7 @@ struct PlaybackContext<'a> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let audio_files = audio_files_in(&args.directory)?;
+    let audio_files = audio_files_in(&args.directory, args.recursive)?;
 
     if audio_files.is_empty() {
         println!("No audio files found in {}.", args.directory.display());
@@ -666,15 +669,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn audio_files_in(directory: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut audio_files = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file() && is_supported_audio_file(path))
-        .collect::<Vec<_>>();
-
+fn audio_files_in(directory: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+    let mut audio_files = Vec::new();
+    scan_directory(directory, recursive, &mut audio_files)?;
     audio_files.sort();
     Ok(audio_files)
+}
+
+fn scan_directory(
+    directory: &Path,
+    recursive: bool,
+    audio_files: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recursive {
+                scan_directory(&path, true, audio_files)?;
+            }
+        } else if path.is_file() && is_supported_audio_file(&path) {
+            audio_files.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn fuzzy_track_indices(audio_files: &[PathBuf], query: &str) -> Vec<usize> {
