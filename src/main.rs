@@ -307,7 +307,7 @@ impl PlayerState {
             current_metadata: None,
             visualizer_theme: VisualizerTheme::Cyberpunk,
             status: String::from(
-                "Use / to search, j/k to select, Enter to play, Left/Right to seek.",
+                "Use [/] to search, [j]/[k] to select, [Enter] to play, [←]/[→] to seek.",
             ),
         }
     }
@@ -491,7 +491,7 @@ impl PlayerState {
             }
             KeyCode::Char('/') => {
                 self.is_searching = true;
-                self.status = String::from("Type to fuzzy-search tracks. Esc clears search.");
+                self.status = String::from("Type to fuzzy-search tracks. [Esc] clears search.");
             }
             // 'a' and 'r' are aliases — both toggle the repeat mode.
             KeyCode::Char('a' | 'A' | 'r' | 'R') => {
@@ -1110,7 +1110,7 @@ fn draw(
 
 fn write_header(stdout: &mut impl Write, width: usize) -> io::Result<()> {
     let title = " eurhythm ";
-    let controls = " / search  r repeat  s shuffle  t theme  Enter play  q quit ";
+    let controls = " [/] search  [r] repeat  [s] shuffle  [t] theme  [Enter] play  [q] quit ";
     let fill = width.saturating_sub(2 + title.chars().count() + controls.chars().count());
 
     execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
