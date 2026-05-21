@@ -22,11 +22,11 @@ use std::{
 };
 
 const SPECTRUM_BANDS: usize = 48;
-const SPECTRUM_FPS: u32 = 24;
+const SPECTRUM_FPS: u32 = 60;
 const FFT_SIZE: usize = 2048;
-const BAR_RISE_EASING: f32 = 0.55;
-const BAR_FALL_EASING: f32 = 0.18;
-const PEAK_FALL_SPEED: f32 = 0.22;
+const BAR_RISE_EASING: f32 = 0.273;
+const BAR_FALL_EASING: f32 = 0.077;
+const PEAK_FALL_SPEED: f32 = 0.088;
 const METER_BAR_WIDTH: usize = 2;
 const METER_BAR_GAP: usize = 1;
 const METER_HEIGHT: usize = 10;
@@ -646,7 +646,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
         draw(&ctx, &mut state.meter_state, &mut state.render_state)?;
 
-        if !event::poll(Duration::from_millis(90))? {
+        if !event::poll(Duration::from_millis(16))? {
             continue;
         }
 
