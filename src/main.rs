@@ -291,10 +291,11 @@ struct PlayerState {
     current_metadata: Option<TrackMetadata>,
     visualizer_theme: VisualizerTheme,
     status: String,
+    base_directory: PathBuf,
 }
 
 impl PlayerState {
-    fn new() -> Self {
+    fn new(base_directory: PathBuf) -> Self {
         Self {
             current_index: 0,
             playing_index: None,
@@ -312,6 +313,7 @@ impl PlayerState {
             status: String::from(
                 "Use [/] to search, [j]/[k] to select, [Enter] to play, [←]/[→] to seek.",
             ),
+            base_directory,
         }
     }
 
@@ -334,7 +336,7 @@ impl PlayerState {
                 if self.playing_index == Some(index) {
                     self.current_visual = Some(visual);
                     self.meter_state.clear();
-                    self.status = format!("Playing {}.", display_name(&audio_files[index]));
+                    self.status = format!("Playing {}.", display_name(&audio_files[index], &self.base_directory));
                 }
             }
             Some((index, Ok(AnalysisMessage::Failed(error)))) => {
@@ -342,7 +344,7 @@ impl PlayerState {
                 if self.playing_index == Some(index) {
                     self.status = format!(
                         "Spectrum unavailable for {}: {error}",
-                        display_name(&audio_files[index])
+                        display_name(&audio_files[index], &self.base_directory)
                     );
                 }
             }
@@ -398,13 +400,13 @@ impl PlayerState {
                 self.playing_index = Some(index);
                 self.current_visual = None;
                 self.pending_analysis = Some(analysis);
-                self.status = format!("Playing {}.", display_name(path));
+                self.status = format!("Playing {}.", display_name(path, &self.base_directory));
             }
             Err(error) => {
                 self.playing_index = None;
                 self.current_visual = None;
                 self.pending_analysis = None;
-                self.status = format!("Could not play {}: {error}", display_name(path));
+                self.status = format!("Could not play {}: {error}", display_name(path, &self.base_directory));
             }
         }
     }
@@ -438,7 +440,7 @@ impl PlayerState {
                 _ => {}
             }
 
-            let updated_indices = fuzzy_track_indices(audio_files, &self.search_query);
+            let updated_indices = fuzzy_track_indices(audio_files, &self.search_query, &self.base_directory);
             if let Some(&index) = updated_indices.first() {
                 self.current_index = index;
             }
@@ -523,10 +525,10 @@ impl PlayerState {
                 if let Some(index) = self.playing_index {
                     if player.is_paused() {
                         player.play();
-                        self.status = format!("Playing {}.", display_name(&audio_files[index]));
+                        self.status = format!("Playing {}.", display_name(&audio_files[index], &self.base_directory));
                     } else {
                         player.pause();
-                        self.status = format!("Paused {}.", display_name(&audio_files[index]));
+                        self.status = format!("Paused {}.", display_name(&audio_files[index], &self.base_directory));
                     }
                 } else {
                     if !playlist_indices.contains(&self.current_index) {
@@ -600,11 +602,13 @@ struct PlaybackContext<'a> {
     visualizer_theme: VisualizerTheme,
     search_query: &'a str,
     is_searching: bool,
+    base_directory: &'a Path,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let audio_files = audio_files_in(&args.directory, args.recursive)?;
+    let base_dir = fs::canonicalize(&args.directory)?;
+    let audio_files = audio_files_in(&base_dir, args.recursive)?;
 
     if audio_files.is_empty() {
         println!("No audio files found in {}.", args.directory.display());
@@ -615,10 +619,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device_sink = rodio::DeviceSinkBuilder::open_default_sink()?;
     let player = Player::connect_new(device_sink.mixer());
 
-    let mut state = PlayerState::new();
+    let mut state = PlayerState::new(base_dir.clone());
 
     loop {
-        let playlist_indices = fuzzy_track_indices(&audio_files, &state.search_query);
+        let playlist_indices = fuzzy_track_indices(&audio_files, &state.search_query, &base_dir);
 
         state.process_analysis_update(&audio_files);
         state.advance_if_finished(&player, &audio_files, &playlist_indices);
@@ -646,6 +650,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             visualizer_theme: state.visualizer_theme,
             search_query: &state.search_query,
             is_searching: state.is_searching,
+            base_directory: &base_dir,
         };
         draw(&ctx, &mut state.meter_state, &mut state.render_state)?;
 
@@ -695,7 +700,7 @@ fn scan_directory(
     Ok(())
 }
 
-fn fuzzy_track_indices(audio_files: &[PathBuf], query: &str) -> Vec<usize> {
+fn fuzzy_track_indices(audio_files: &[PathBuf], query: &str, base_directory: &Path) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..audio_files.len()).collect();
     }
@@ -704,7 +709,8 @@ fn fuzzy_track_indices(audio_files: &[PathBuf], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, path)| {
-            fuzzy_score(&display_name(path), query).map(|score| (index, score, display_name(path)))
+            let d_name = display_name(path, base_directory);
+            fuzzy_score(&d_name, query).map(|score| (index, score, d_name))
         })
         .collect::<Vec<_>>();
 
@@ -1153,7 +1159,7 @@ fn write_playback_panel(
 
     let now_playing = ctx
         .playing_index
-        .map(|index| display_name(&ctx.audio_files[index]))
+        .map(|index| display_name(&ctx.audio_files[index], ctx.base_directory))
         .unwrap_or_else(|| String::from("none"));
 
     let state_str = match (ctx.playing_index.is_some(), ctx.is_paused) {
@@ -1331,7 +1337,7 @@ fn write_playlist_panel(
     ctx: &PlaybackContext<'_>,
     width: usize,
 ) -> io::Result<()> {
-    let title = playlist_title(ctx.search_query, ctx.is_searching, ctx.playlist_indices.len());
+    let title = playlist_title(ctx.search_query, ctx.is_searching, ctx.playlist_indices.len(), ctx.base_directory);
     write_panel_top(stdout, &title, width, Color::Red)?;
 
     let visible_rows = playlist_visible_rows();
@@ -1353,7 +1359,7 @@ fn write_playlist_panel(
         let is_selected = index == ctx.current_index;
         let is_playing = Some(index) == ctx.playing_index;
         let state_str = if is_playing { " [PLAYING]" } else { "" };
-        let name_str = display_name(path);
+        let name_str = display_name(path, ctx.base_directory);
 
         execute!(stdout, SetForegroundColor(Color::DarkGrey))?;
         write!(stdout, "│ ")?;
@@ -1454,13 +1460,14 @@ fn write_playlist_row(
     Ok(())
 }
 
-fn playlist_title(search_query: &str, is_searching: bool, match_count: usize) -> String {
+fn playlist_title(search_query: &str, is_searching: bool, match_count: usize, base_directory: &Path) -> String {
+    let dir_name = base_directory.to_string_lossy();
     if search_query.is_empty() && !is_searching {
-        return String::from("playlist");
+        format!("playlist [ {dir_name} ]")
+    } else {
+        let cursor = if is_searching { "_" } else { "" };
+        format!("playlist [ {dir_name} ] /{search_query}{cursor} ({match_count})")
     }
-
-    let cursor = if is_searching { "_" } else { "" };
-    format!("playlist /{search_query}{cursor} ({match_count})")
 }
 
 fn playlist_visible_rows() -> usize {
@@ -1763,9 +1770,37 @@ fn truncate(value: &str, max_len: usize) -> String {
     truncated
 }
 
-fn display_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("<invalid file name>")
-        .to_owned()
+fn display_name(path: &Path, base_directory: &Path) -> String {
+    path.strip_prefix(base_directory)
+        .ok()
+        .and_then(|rel| rel.to_str())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<invalid file name>")
+                .to_owned()
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_display_name_relative() {
+        let base = Path::new("/home/user/music");
+        let path1 = Path::new("/home/user/music/Artist/Album/Song.mp3");
+        assert_eq!(display_name(path1, base), "Artist/Album/Song.mp3");
+
+        let path2 = Path::new("/home/user/music/Song.mp3");
+        assert_eq!(display_name(path2, base), "Song.mp3");
+    }
+
+    #[test]
+    fn test_display_name_fallback() {
+        let base = Path::new("/home/user/other_music");
+        let path = Path::new("/home/user/music/Artist/Album/Song.mp3");
+        assert_eq!(display_name(path, base), "Song.mp3");
+    }
 }
