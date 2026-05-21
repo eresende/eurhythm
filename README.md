@@ -74,7 +74,7 @@ Built from the ground up using pure-Rust high-fidelity abstractions:
 * **[`rodio`](https://github.com/RustAudio/rodio)**: Audio playback engine.
 * **[`rustfft`](https://github.com/ejmahler/RustFFT)**: High-performance FFT library for real-time spectrum analysis.
 * **[`crossterm`](https://github.com/crossterm-rs/crossterm)**: Pure Rust terminal manipulation for fast, raw-mode TUI rendering.
-* **[`lofty`](https://github.com/HexagonTek/lofty)**: Robust audio metadata (ID3 tags) parsing.
+* **[`lofty`](https://github.com/Serial-ATA/lofty-rs)**: Robust audio metadata (ID3 tags) parsing.
 
 ---
 
