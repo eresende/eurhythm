@@ -2,7 +2,7 @@
 
 A premium, high-performance TUI (Terminal User Interface) music player and real-time audio spectrum visualizer written in Rust.
 
-`eurhythm` combines low-latency playback engine design with highly optimized, hardware-accelerated Fast Fourier Transform (FFT) spectrum calculations and 24-bit True Color gradients. It's designed to turn your terminal into a gorgeous, reactive music dashboard.
+`eurhythm` combines low-latency playback engine design with highly optimized, hardware-accelerated Fast Fourier Transform (FFT) spectrum calculations and 24-bit True Color gradients. It's designed [...]
 
 <p align="center">
   <img src="assets/screenshot-1.png" alt="eurhythm TUI Music Player - Cyberpunk Theme" width="49%" />
@@ -75,6 +75,12 @@ Built from the ground up using pure-Rust high-fidelity abstractions:
 * **[`rustfft`](https://github.com/ejmahler/RustFFT)**: High-performance FFT library for real-time spectrum analysis.
 * **[`crossterm`](https://github.com/crossterm-rs/crossterm)**: Pure Rust terminal manipulation for fast, raw-mode TUI rendering.
 * **[`lofty`](https://github.com/HexagonTek/lofty)**: Robust audio metadata (ID3 tags) parsing.
+
+---
+
+## 📜 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
 
